@@ -24,7 +24,7 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
-#include <experimental/optional>
+#include "util/std-compat.hh"
 
 #include "../core/future.hh"
 #include "../core/sstring.hh"
@@ -56,7 +56,14 @@ struct hostent {
     std::vector<inet_address> addr_list;
 };
 
-typedef std::experimental::optional<inet_address::family> opt_family;
+typedef compat::optional<inet_address::family> opt_family;
+
+struct srv_record {
+    unsigned short priority;
+    unsigned short weight;
+    unsigned short port;
+    sstring target;
+};
 
 /**
  * A DNS resolver object.
@@ -69,17 +76,22 @@ typedef std::experimental::optional<inet_address::family> opt_family;
 class dns_resolver {
 public:
     struct options {
-        std::experimental::optional<bool>
+        compat::optional<bool>
             use_tcp_query;
-        std::experimental::optional<std::vector<inet_address>>
+        compat::optional<std::vector<inet_address>>
             servers;
-        std::experimental::optional<std::chrono::milliseconds>
+        compat::optional<std::chrono::milliseconds>
             timeout;
-        std::experimental::optional<uint16_t>
+        compat::optional<uint16_t>
             tcp_port, udp_port;
-        std::experimental::optional<std::vector<sstring>>
+        compat::optional<std::vector<sstring>>
             domains;
     };
+
+    enum class srv_proto {
+        tcp, udp
+    };
+    using srv_records = std::vector<srv_record>;
 
     dns_resolver();
     dns_resolver(dns_resolver&&) noexcept;
@@ -108,6 +120,13 @@ public:
     future<sstring> resolve_addr(const inet_address&);
 
     /**
+     * Resolve a service in given domain to one or more SRV records
+     */
+    future<srv_records> get_srv_records(srv_proto proto,
+                                        const sstring& service,
+                                        const sstring& domain);
+
+    /**
      * Shuts the object down. Great for tests.
      */
     future<> close();
@@ -125,6 +144,10 @@ future<hostent> get_host_by_addr(const inet_address&);
 
 future<inet_address> resolve_name(const sstring&, opt_family = {});
 future<sstring> resolve_addr(const inet_address&);
+
+future<std::vector<srv_record>> get_srv_records(dns_resolver::srv_proto proto,
+                                                const sstring& service,
+                                                const sstring& domain);
 
 }
 

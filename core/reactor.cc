@@ -203,6 +203,9 @@ std::atomic<lowres_clock_impl::system_rep> lowres_clock_impl::counters::_system_
 std::atomic<manual_clock::rep> manual_clock::_now;
 constexpr std::chrono::milliseconds lowres_clock_impl::_granularity;
 
+constexpr unsigned reactor::max_queues;
+constexpr unsigned reactor::max_aio_per_queue;
+
 static bool sched_debug() {
     return false;
 }
@@ -242,6 +245,8 @@ template <typename T>
 struct syscall_result {
     T result;
     int error;
+    syscall_result(T result, int error) : result{std::move(result)}, error{error} {
+    }
     void throw_if_error() {
         if (long(result) == -1) {
             throw std::system_error(ec());
@@ -270,21 +275,20 @@ protected:
 template <typename Extra>
 struct syscall_result_extra : public syscall_result<int> {
     Extra extra;
+    syscall_result_extra(int result, int error, Extra e) : syscall_result<int>{result, error}, extra{std::move(e)} {
+    }
 };
 
 template <typename T>
 syscall_result<T>
 wrap_syscall(T result) {
-    syscall_result<T> sr;
-    sr.result = result;
-    sr.error = errno;
-    return sr;
+    return syscall_result<T>{std::move(result), errno};
 }
 
 template <typename Extra>
 syscall_result_extra<Extra>
 wrap_syscall(int result, const Extra& extra) {
-    return {result, errno, extra};
+    return syscall_result_extra<Extra>{result, errno, extra};
 }
 
 reactor_backend_epoll::reactor_backend_epoll()
@@ -348,7 +352,22 @@ bool reactor::signals::pure_poll_signal() const {
 
 void reactor::signals::action(int signo, siginfo_t* siginfo, void* ignore) {
     g_need_preempt = true;
-    engine()._signals._pending_signals.fetch_or(1ull << signo, std::memory_order_relaxed);
+    if (engine_is_ready()) {
+        engine()._signals._pending_signals.fetch_or(1ull << signo, std::memory_order_relaxed);
+    } else {
+        failed_to_handle(signo);
+    }
+}
+
+void reactor::signals::failed_to_handle(int signo) {
+    char tname[64];
+    pthread_getname_np(pthread_self(), tname, sizeof(tname));
+    auto tid = syscall(SYS_gettid);
+    seastar_logger.error("Failed to handle signal {} on thread {} ({}): engine not ready", signo, tid, tname);
+}
+
+void reactor::handle_signal(int signo, std::function<void ()>&& handler) {
+    _signals.handle_signal(signo, std::move(handler));
 }
 
 // Accumulates an in-memory backtrace and flush to stderr eventually.
@@ -574,6 +593,7 @@ reactor::~reactor() {
     assert(r == 0);
 
     _dying.store(true, std::memory_order_relaxed);
+    _task_quota_timer.timerfd_settime(0, seastar::posix::to_relative_itimerspec(1ns, 1ms)); // Make the timer fire soon
     _task_quota_timer_thread.join();
     timer_delete(_steady_clock_timer);
     auto eraser = [](auto& list) {
@@ -607,6 +627,17 @@ void
 reactor::task_quota_timer_thread_fn() {
     auto thread_name = seastar::format("timer-{}", _id);
     pthread_setname_np(pthread_self(), thread_name.c_str());
+
+    sigset_t mask;
+    sigfillset(&mask);            
+    for (auto sig : { SIGSEGV }) {
+        sigdelset(&mask, sig);
+    }
+    auto r = ::pthread_sigmask(SIG_BLOCK, &mask, NULL);
+    if (r) {
+        seastar_logger.info("Thread {}: failed to block signals. Aborting.", thread_name.c_str());
+        abort();
+    }
 
     unsigned report_at = _tasks_processed_report_threshold;
     uint64_t last_tasks_processed_seen = 0;
@@ -696,6 +727,14 @@ reactor::task_quota_timer_thread_fn() {
         // We're in a different thread, but guaranteed to be on the same core, so even
         // a signal fence is overdoing it
         std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+}
+void 
+reactor::update_blocked_reactor_notify_ms(std::chrono::milliseconds ms) {
+    unsigned threshold = ms / _task_quota;
+    if (threshold != _tasks_processed_report_threshold) {
+        _tasks_processed_report_threshold = threshold;
+        seastar_logger.info("updated: blocked-reactor-notify-ms={}", ms.count());
     }
 }
 
@@ -2016,7 +2055,7 @@ directory_entry_type stat_to_entry_type(__mode_t type) {
 
 }
 
-future<std::experimental::optional<directory_entry_type>>
+future<compat::optional<directory_entry_type>>
 reactor::file_type(sstring name) {
     return _thread_pool.submit<syscall_result_extra<struct stat>>([name] {
         struct stat st;
@@ -2027,11 +2066,11 @@ reactor::file_type(sstring name) {
             if (sr.error != ENOENT && sr.error != ENOTDIR) {
                 sr.throw_fs_exception_if_error("stat failed", name);
             }
-            return make_ready_future<std::experimental::optional<directory_entry_type> >
-                (std::experimental::optional<directory_entry_type>() );
+            return make_ready_future<compat::optional<directory_entry_type> >
+                (compat::optional<directory_entry_type>() );
         }
-        return make_ready_future<std::experimental::optional<directory_entry_type> >
-            (std::experimental::optional<directory_entry_type>(stat_to_entry_type(sr.extra.st_mode)) );
+        return make_ready_future<compat::optional<directory_entry_type> >
+            (compat::optional<directory_entry_type>(stat_to_entry_type(sr.extra.st_mode)) );
     });
 }
 
@@ -2389,7 +2428,7 @@ posix_file_impl::list_directory(std::function<future<> (directory_entry de)> nex
             }
             auto start = w->buffer + w->current;
             auto de = reinterpret_cast<linux_dirent64*>(start);
-            std::experimental::optional<directory_entry_type> type;
+            compat::optional<directory_entry_type> type;
             switch (de->d_type) {
             case DT_BLK:
                 type = directory_entry_type::block_device;
@@ -2611,7 +2650,7 @@ void reactor::register_metrics() {
     for (auto& ioq : my_io_queues) {
         auto ioq_name = ioq_group(ioq->mountpoint());
         _metric_groups.add_group("reactor", {
-                sm::make_gauge("io_queue_requests", [this, &ioq] { return ioq->queued_requests(); } , sm::description("Number of requests in the io queue"), {ioq_name}),
+                sm::make_gauge("io_queue_requests", [&ioq] { return ioq->queued_requests(); } , sm::description("Number of requests in the io queue"), {ioq_name}),
         });
     }
 
@@ -3118,9 +3157,9 @@ int reactor::run() {
 
     register_metrics();
 
-    std::experimental::optional<poller> io_poller = {};
-    std::experimental::optional<poller> aio_poller = {};
-    std::experimental::optional<poller> smp_poller = {};
+    compat::optional<poller> io_poller = {};
+    compat::optional<poller> aio_poller = {};
+    compat::optional<poller> smp_poller = {};
 
     // I/O Performance greatly increases if the smp poller runs before the I/O poller. This is
     // because requests that were just added can be polled and processed by the I/O poller right
@@ -3620,7 +3659,7 @@ void smp_message_queue::flush_request_batch() {
 }
 
 size_t smp_message_queue::process_incoming() {
-    auto nr = process_queue<prefetch_cnt>(_pending, [this] (work_item* wi) {
+    auto nr = process_queue<prefetch_cnt>(_pending, [] (work_item* wi) {
         wi->process();
     });
     _received += nr;
@@ -3859,7 +3898,7 @@ thread_local std::unique_ptr<reactor, reactor_deleter> reactor_holder;
 
 std::vector<posix_thread> smp::_threads;
 std::vector<std::function<void ()>> smp::_thread_loops;
-std::experimental::optional<boost::barrier> smp::_all_event_loops_done;
+compat::optional<boost::barrier> smp::_all_event_loops_done;
 std::vector<reactor*> smp::_reactors;
 std::unique_ptr<smp_message_queue*[], smp::qs_deleter> smp::_qs;
 std::thread::id smp::_tmain;
@@ -3998,7 +4037,7 @@ void smp::qs_deleter::operator()(smp_message_queue** qs) const {
 class disk_config_params {
 public:
     unsigned _num_io_queues = smp::count;
-    unsigned _capacity = std::numeric_limits<unsigned>::max();
+    compat::optional<unsigned> _capacity;
     std::unordered_map<dev_t, mountpoint_params> _mountpoints;
     std::chrono::duration<double> _latency_goal;
 
@@ -4022,7 +4061,7 @@ public:
             throw std::runtime_error("Both io-properties and io-properties-file specified. Don't know which to trust!");
         }
 
-        std::experimental::optional<YAML::Node> doc;
+        compat::optional<YAML::Node> doc;
         if (configuration.count("io-properties-file")) {
             doc = YAML::LoadFile(configuration["io-properties-file"].as<std::string>());
         } else if (configuration.count("io-properties")) {
@@ -4064,8 +4103,7 @@ public:
         uint64_t max_bandwidth = std::max(p.read_bytes_rate, p.write_bytes_rate);
         uint64_t max_iops = std::max(p.read_req_rate, p.write_req_rate);
 
-        cfg.capacity = per_io_queue(_capacity);
-        if (cfg.capacity == std::numeric_limits<unsigned>::max()) {
+        if (!_capacity) {
             cfg.disk_bytes_write_to_read_multiplier = (io_queue::read_request_base_count * p.read_bytes_rate) / p.write_bytes_rate;
             cfg.disk_req_write_to_read_multiplier = (io_queue::read_request_base_count * p.read_req_rate) / p.write_req_rate;
             cfg.max_req_count = max_bandwidth == std::numeric_limits<uint64_t>::max()
@@ -4076,6 +4114,7 @@ public:
                 : io_queue::read_request_base_count * per_io_queue(max_bandwidth * _latency_goal.count());
             cfg.mountpoint = p.mountpoint;
         } else {
+            cfg.capacity = per_io_queue(*_capacity);
             cfg.disk_bytes_write_to_read_multiplier = 1;
             cfg.disk_req_write_to_read_multiplier = 1;
         }
@@ -4170,7 +4209,7 @@ void smp::configure(boost::program_options::variables_map configuration)
     if (configuration.count("reserve-memory")) {
         rc.reserve_memory = parse_memory_size(configuration["reserve-memory"].as<std::string>());
     }
-    std::experimental::optional<std::string> hugepages_path;
+    compat::optional<std::string> hugepages_path;
     if (configuration.count("hugepages")) {
         hugepages_path = configuration["hugepages"].as<std::string>();
     }
@@ -4499,7 +4538,7 @@ reactor_backend_osv::enable_timer(steady_clock_type::time_point when) {
 
 #endif
 
-void report_exception(std::experimental::string_view message, std::exception_ptr eptr) noexcept {
+void report_exception(compat::string_view message, std::exception_ptr eptr) noexcept {
     seastar_logger.error("{}: {}", message, eptr);
 }
 
@@ -4527,7 +4566,7 @@ future<> check_direct_io_support(sstring path) {
         open_flags flags;
         std::function<future<>()> cleanup;
 
-        static w parse(sstring path, std::experimental::optional<directory_entry_type> type) {
+        static w parse(sstring path, compat::optional<directory_entry_type> type) {
             if (!type) {
                 throw std::invalid_argument(sprint("Could not open file at %s. Make sure it exists", path));
             }

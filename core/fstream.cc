@@ -48,7 +48,7 @@ class file_data_source_impl : public data_source_impl {
     unsigned _reads_in_progress = 0;
     unsigned _current_read_ahead;
     future<> _dropped_reads = make_ready_future<>();
-    std::experimental::optional<promise<>> _done;
+    compat::optional<promise<>> _done;
     size_t _current_buffer_size;
     bool _in_slow_start = false;
     using unused_ratio_target = std::ratio<25, 100>;
@@ -325,6 +325,7 @@ public:
     virtual temporary_buffer<char> allocate_buffer(size_t size) override {
         return temporary_buffer<char>::aligned(_file.memory_dma_alignment(), size);
     }
+    using data_sink_impl::put;
     virtual future<> put(temporary_buffer<char> buf) override {
         uint64_t pos = _pos;
         _pos += buf.size();

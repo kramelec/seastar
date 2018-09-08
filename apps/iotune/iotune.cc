@@ -47,6 +47,7 @@
 #include "core/fsqual.hh"
 #include "util/defer.hh"
 #include "util/log.hh"
+#include "util/std-compat.hh"
 
 using namespace seastar;
 using namespace std::chrono_literals;
@@ -561,7 +562,7 @@ void write_property_file(sstring conf_file, struct std::vector<disk_descriptor> 
 // (absolute, with symlinks resolved), until we find a point that crosses a device ID.
 fs::path mountpoint_of(sstring filename) {
     fs::path mnt_candidate = fs::canonical(fs::path(filename));
-    std::experimental::optional<dev_t> candidate_id = {};
+    compat::optional<dev_t> candidate_id = {};
     auto current = mnt_candidate;
     do {
         auto f = open_directory(current.string()).get0();
@@ -576,6 +577,9 @@ fs::path mountpoint_of(sstring filename) {
 
     return mnt_candidate;
 }
+
+static constexpr unsigned task_quotas_in_default_latency_goal = 3;
+static constexpr float latency_goal = 0.0005;
 
 int main(int ac, char** av) {
     namespace bpo = boost::program_options;
@@ -673,10 +677,15 @@ int main(int ac, char** av) {
 
             unsigned num_io_queues = smp::count;
             for (auto& desc : disk_descriptors) {
-                // Allow each I/O Queue to have at least 10k IOPS and 100MB. Values decided based
-                // on the write performance, which tends to be lower.
-                num_io_queues = std::min(smp::count, unsigned(desc.write_iops / 10000));
-                num_io_queues = std::min(smp::count, unsigned(desc.write_bw / (100 * 1024 * 1024)));
+                // Ideally we wouldn't have I/O Queues and would dispatch from every shard (https://github.com/scylladb/seastar/issues/485)
+                // While we don't do that, we'll just be conservative and try to recommend values of I/O Queues that are close to what we
+                // suggested before the I/O Scheduler rework. The I/O Scheduler has traditionally tried to make sure that each queue would have
+                // at least 4 requests in depth, and all its requests were 4kB in size. Therefore, try to arrange the I/O Queues so that we would
+                // end up in the same situation here (that's where the 4 comes from).
+                //
+                // For the bandwidth limit, we want that to be 4 * 4096, so each I/O Queue has the same bandwidth as before.
+                num_io_queues = std::min(smp::count, unsigned((task_quotas_in_default_latency_goal * desc.write_iops * latency_goal) / 4));
+                num_io_queues = std::min(num_io_queues, unsigned((task_quotas_in_default_latency_goal * desc.write_bw * latency_goal) / (4 * 4096)));
                 num_io_queues = std::max(num_io_queues, 1u);
             }
             fmt::print("Recommended --num-io-queues: {}\n", num_io_queues);

@@ -21,7 +21,7 @@
 
 #pragma once
 
-#include <boost/variant.hpp>
+#include "util/std-compat.hh"
 #include <boost/version.hpp>
 
 #if (BOOST_VERSION < 105800)
@@ -105,11 +105,49 @@ template <typename Variant, typename... Args>
 inline auto visit(Variant&& variant, Args&&... args)
 {
     static_assert(sizeof...(Args) > 0, "At least one lambda must be provided for visitation");
+#ifdef SEASTAR_USE_STD_OPTIONAL_VARIANT_STRINGVIEW
+    return std::visit(
+#else
     return boost::apply_visitor(
+#endif
         make_visitor(std::forward<Args>(args)...),
         variant);
-};
+}
 
+#ifdef SEASTAR_USE_STD_OPTIONAL_VARIANT_STRINGVIEW
+
+namespace internal {
+template<typename... Args>
+struct castable_variant {
+    compat::variant<Args...> var;
+
+    template<typename... SuperArgs>
+    operator compat::variant<SuperArgs...>() && {
+        return std::visit([] (auto&& x) {
+            return std::variant<SuperArgs...>(std::move(x));
+        }, var);
+    }
+};
+}
+
+template<typename... Args>
+internal::castable_variant<Args...> variant_cast(compat::variant<Args...>&& var) {
+    return {std::move(var)};
+}
+
+template<typename... Args>
+internal::castable_variant<Args...> variant_cast(const compat::variant<Args...>& var) {
+    return {var};
+}
+
+#else
+
+template<typename Variant>
+Variant variant_cast(Variant&& var) {
+    return std::forward<Variant>(var);
+}
+
+#endif
 
 /// @}
 

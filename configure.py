@@ -157,7 +157,7 @@ def dialect_supported(dialect, compiler='g++'):
 def detect_membarrier(compiler, flags):
     return try_compile(compiler=compiler, flags=flags, source=textwrap.dedent('''\
         #include <linux/membarrier.h>
-        
+
         int x = MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
         '''))
 
@@ -305,6 +305,8 @@ tests = [
     'tests/netconfig_test',
     'tests/abort_source_test',
     'tests/alien_test',
+    'tests/signal_test',
+    'tests/simple_stream_test',
     ] + perf_tests
 
 apps = [
@@ -321,13 +323,6 @@ extralibs = {
 }
 
 all_artifacts = apps + tests + ['libseastar.a', 'seastar.pc', 'fmt/fmt/libfmt.a']
-
-cpp_dialects = ['gnu++17', 'gnu++1z', 'gnu++14', 'gnu++1y']
-try:
-    default_cpp_dialect = [x for x in cpp_dialects if dialect_supported(x, compiler='g++')][0]
-except:
-    # if g++ is not available, fallback to something safe-ish
-    default_cpp_dialect='gnu++1y'
 
 arg_parser = argparse.ArgumentParser('Configure seastar')
 arg_parser.add_argument('--static', dest = 'static', action = 'store_const', default = '',
@@ -349,7 +344,7 @@ arg_parser.add_argument('--compiler', action = 'store', dest = 'cxx', default = 
                         help = 'C++ compiler path')
 arg_parser.add_argument('--c-compiler', action='store', dest='cc', default='gcc',
                         help = 'C compiler path (for bundled libraries such as dpdk and c-ares)')
-arg_parser.add_argument('--c++-dialect', action='store', dest='cpp_dialect', default=default_cpp_dialect,
+arg_parser.add_argument('--c++-dialect', action='store', dest='cpp_dialect', default='',
                         help='C++ dialect to build with [default: %(default)s]')
 arg_parser.add_argument('--with-osv', action = 'store', dest = 'with_osv', default = '',
                         help = 'Shortcut for compile for OSv')
@@ -381,7 +376,18 @@ arg_parser.add_argument('--cmake', dest='cmake', action='store_true',
                         help='Use CMake as the underlying build-sytem')
 arg_parser.add_argument('--without-tests', dest='exclude_tests', action='store_true', help='Do not build tests by default (CMake only)')
 arg_parser.add_argument('--without-apps', dest='exclude_apps', action='store_true', help='Do not build applications by default (CMake only)')
+arg_parser.add_argument('--use-std-optional-variant-stringview', dest='cpp17_goodies', action='store', type=int, default=0,
+                        help='Use C++17 std types for optional, variant, and string_view. Requires C++17 dialect and GCC >= 8.1.1-5')
 args = arg_parser.parse_args()
+
+
+if args.cpp_dialect == '':
+    cpp_dialects = ['gnu++17', 'gnu++1z', 'gnu++14', 'gnu++1y']
+    try:
+        args.cpp_dialect = [x for x in cpp_dialects if dialect_supported(x, compiler=args.cxx)][0]
+    except:
+        # if g++ is not available, fallback to something safe-ish
+        args.cpp_dialect='gnu++1y'
 
 # Forwarding to CMake.
 if args.cmake:
@@ -411,6 +417,7 @@ if args.cmake:
             tr(args.alloc_failure_injector, 'ENABLE_ALLOC_FAILURE_INJECTOR'),
             tr(args.exception_workaround, 'ENABLE_EXCEPTION_SCALABILITY_WORKAROUND'),
             tr(args.allocator_page_size, 'ALLOCATOR_PAGE_SIZE'),
+            tr(args.cpp17_goodies, 'USE_STD_OPTIONAL_VARIANT_STRINGVIEW'),
         ]
 
         # Generate a new build by pointing to the source directory.
@@ -518,6 +525,8 @@ libs = ' '.join([maybe_static(args.staticboost,
 
 boost_unit_test_lib = maybe_static(args.staticboost, '-lboost_unit_test_framework')
 
+if args.cpp17_goodies is 1 and args.cpp_dialect == 'gnu++17':
+    defines.append('SEASTAR_USE_STD_OPTIONAL_VARIANT_STRINGVIEW')
 
 hwloc_libs = '-lhwloc -lnuma -lpciaccess -lxml2 -lz'
 
@@ -613,6 +622,8 @@ deps = {
     'tests/netconfig_test': ['tests/netconfig_test.cc'] + core + libnet,
     'tests/abort_source_test': ['tests/abort_source_test.cc'] + core,
     'tests/alien_test': ['tests/alien_test.cc'] + core,
+    'tests/signal_test': ['tests/signal_test.cc'] + core,
+    'tests/simple_stream_test': ['tests/simple_stream_test.cc'] + core,
 }
 
 boost_tests = [
@@ -636,6 +647,7 @@ boost_tests = [
     'tests/execution_stage_test',
     'tests/lowres_clock_test',
     'tests/abort_source_test',
+    'tests/signal_test',
     ]
 
 for bt in boost_tests:
